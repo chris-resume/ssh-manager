@@ -1,0 +1,1462 @@
+#!/usr/bin/env bash
+
+
+#####################################
+## SSH Manager with extra features ##
+#####################################
+
+
+# verify Bash version in a POSIX-compliant way
+case $BASH_VERSINFO in
+    ''|*[!0-9]*|0?*|[0-4])
+        >&2 printf '\e[1m%s\e[0m\n' 'ERROR: Bash version ≥5 is required!'
+        exit 255
+        ;;
+esac
+
+# shell options
+set -euo pipefail
+set -E
+
+# verify if operating system is Linux
+if [[ $OSTYPE != linux-gnu ]]; then
+    >&2 echo -e '\e[1mERROR: Linux operating system is required!\e[0m'
+    exit 255
+fi
+
+# refuse to run as root
+if [[ $EUID -eq 0 ]]; then
+    >&2 echo -e '\e[1mERROR: Refusing to run as root!\e[0m'
+    exit 255
+fi
+
+# refuse to run if sourced
+if (return 0 2>/dev/null); then
+    >&2 echo -e '\e[1mERROR: Refusing to run as being sourced!\e[0m'
+    exit 255
+fi
+
+# ensure "$HOME" is non-empty and matches `~`
+export HOME=~
+if [[ -z $HOME ]]; then
+    >&2 echo -e '\e[1mERROR: Refusing to run with empty `$HOME`!\e[0m'
+    exit 255
+fi
+
+# generic error
+trap 'if [[ $BASH_SUBSHELL -eq 0 ]]; then >&2 echo -e "\n\e[1mERROR: Unexpected issue!\e[0m" ; exit 255; fi' ERR
+trap '>&2 echo -e "\n\e[1mERROR: Signal interrupt!\e[0m" ; exit 255' HUP TERM
+trap '>&2 echo -e "\n\e[1mINFO: User interrupt.\e[0m" ; exit 0' INT
+
+# unset select variables
+unset CDPATH OLDPWD POSIXLY_CORRECT
+
+# echo control characters
+stty echoctl
+
+# glob-related shell options
+shopt -s dotglob extglob failglob
+
+# shell completion bindings
+bind 'set completion-ignore-case on' 2>/dev/null
+bind 'set show-all-if-ambiguous on' 2>/dev/null
+
+# helper function to return specific status
+__return() { return "$1"; }
+
+# helper function to check availability of required commands
+__command_check() {
+    _command= &&
+    _command_path= &&
+    _commands_missing= &&
+    for _command do
+        if ! { _command_path=$(command -v "$_command") && [[ -x $_command_path ]]; }; then
+            _commands_missing+=" $_command"
+        fi
+    done &&
+
+    if [[ $_commands_missing ]]; then
+        if [[ $is_command_first_check == 1 ]]; then
+            is_command_first_check=0 &&
+            >&2 echo
+        fi &&
+        >&2 echo -e '\e[1mERROR: Missing commands:\e[0m' &&
+        >&2 printf '%s\n' "$_commands_missing" &&
+        >&2 echo -e '\e[1mInstall them and try again.\e[0m' &&
+        exit 255
+    fi
+}
+
+# check availability of globally required commands
+is_command_first_check=1
+__command_check \
+    bwrap fzf grep jq sed ssh sshpass
+
+# verify number of arguments
+if [[ $# -gt 1 ]]; then
+    >&2 echo -e '\e[1mERROR: Too many arguments!\e[0m'
+    exit 255
+fi
+
+# get lockfile directory
+if [[ ${SSH_MANAGER_LOCKFILE_DIR-} ]]; then
+    lockfile_dir=$SSH_MANAGER_LOCKFILE_DIR
+else
+    lockfile_dir=${XDG_RUNTIME_DIR:-/run/user/$EUID}
+fi
+
+# verify lockfile directory
+if ! [[ -d $lockfile_dir && -r $lockfile_dir && -w $lockfile_dir ]]; then
+    >&2 echo -ne '\e[1mERROR: Lockfile directory `\e[0m'
+    >&2 printf %s "$lockfile_dir"
+    >&2 echo -e '\e[1m` is not a directory, or is unreadable or unwritable!\e[0m'
+    exit 255
+fi
+
+# get script generic and directory names
+this_script=$(realpath -s -- "$0" && printf x)
+this_script=${this_script%$'\nx'}
+
+script_generic_name=ssh-manager
+script_generic_dir=$(dirname "$this_script" && printf x)
+script_generic_dir=${script_generic_dir%$'\nx'}
+
+# locking
+lockfile_dir=$(realpath -s -- "$lockfile_dir" && printf x)
+lockfile_dir=${lockfile_dir%$'\nx'}
+lockfile=${lockfile_dir%/}/$script_generic_name.$EUID.lock
+is_lockfile_info=1
+
+_lock_create() {
+    # create lock
+
+    while :; do
+        if ! (set -C && > "$lockfile") 2>/dev/null; then
+            if [[ -e $lockfile || -h $lockfile ]]; then
+                if [[ $is_lockfile_info == 1 ]]; then
+                    is_lockfile_info=0
+                    >&2 echo -ne '\e[1mINFO: Waiting out lockfile `\e[0m'
+                    >&2 printf %s "$lockfile"
+                    >&2 echo -e '\e[1m`…\e[0m'
+                    sleep .5
+                fi
+            else
+                >&2 echo -ne '\e[1mERROR: Unable to create lockfile `\e[0m'
+                >&2 printf %s "$lockfile"
+                >&2 echo -e '\e[1m`! Is its parent a writable directory?\e[0m'
+                exit 255
+            fi
+        else
+            [[ $is_lockfile_info == 0 ]] && >&2 echo
+            break
+        fi
+    done
+
+    return 0
+}
+
+_lock_remove() {
+    # remove lock
+
+    is_lockfile_info=1
+    rm -rf "$lockfile"
+
+    return 0
+}
+
+# clean up lockfile on exit
+trap 'rm -rf "$lockfile"' EXIT
+
+_lock_create
+
+# SSH (external) config file
+ssh_dir=~/.ssh
+if [[ ! -d $ssh_dir ]]; then
+    if [[ -e $ssh_dir ]]; then
+        if [[ -h $ssh_dir ]]; then
+            rm -f -- "$ssh_dir"
+        else
+            >&2 echo -ne '\e[1mERROR: SSH directory `\e[0m'
+            >&2 printf %s "$ssh_dir"
+            >&2 echo -e '\e[1m` exists and is not a directory!\e[0m'
+            exit 255
+        fi
+    fi
+    if [[ -h $ssh_dir ]]; then
+        rm -f -- "$ssh_dir"
+    fi
+    mkdir -pm 700 -- "$ssh_dir"
+fi
+
+ssh_config_file=$ssh_dir/config
+if [[ -d $ssh_config_file && ! -h $ssh_config_file ]]; then
+    >&2 echo -ne '\e[1mERROR: SSH configuration file `\e[0m'
+    >&2 printf %s "$ssh_config_file"
+    >&2 echo -e '\e[1m` is a directory!\e[0m'
+    exit 255
+elif [[ ! -f $ssh_config_file ]]; then
+    install -Tm 600 -- /dev/null "$ssh_config_file"
+fi
+
+# defaults file
+defaults_file=$script_generic_dir/$script_generic_name.defaults
+if [[ -d $defaults_file && ! -h $defaults_file ]]; then
+    >&2 echo -ne '\e[1mERROR: Defaults file `\e[0m'
+    >&2 printf %s "$defaults_file"
+    >&2 echo -e '\e[1m` is a directory!\e[0m'
+    exit 255
+elif [[ ! -f $defaults_file ]]; then
+    install -Tm 600 -- /dev/null "$defaults_file"
+fi
+
+# credentials file
+credentials_file=$script_generic_dir/$script_generic_name.credentials
+if [[ -d $defaults_file && ! -h $defaults_file ]]; then
+    >&2 echo -ne '\e[1mERROR: Credentials file `\e[0m'
+    >&2 printf %s "$credentials_file"
+    >&2 echo -e '\e[1m` is a directory!\e[0m'
+    exit 255
+elif [[ ! -f $credentials_file ]]; then
+    install -Tm 600 <(echo '[]') "$credentials_file"
+    wait $!
+elif [[ -f $credentials_file && ! -s $credentials_file ]]; then
+    echo '[]' > "$credentials_file"
+fi
+
+# cache file
+cache_file=$script_generic_dir/$script_generic_name.cache
+if [[ -d $cache_file && ! -h $cache_file ]]; then
+    >&2 echo -ne '\e[1mERROR: Cache file `\e[0m'
+    >&2 printf %s "$cache_file"
+    >&2 echo -e '\e[1m` is a directory!\e[0m'
+    exit 255
+elif [[ ! -f $cache_file ]]; then
+    install -Tm 600 -- /dev/null "$cache_file"
+fi
+
+####################################################################################################
+
+# passed machine name
+if [[ $# -eq 1 ]]; then
+    if [[ $1 ]]; then
+        Machine=$1
+    else
+        >&2 echo -e '\e[1mERROR: Empty custom name passed!\e[0m'
+        exit 255
+    fi
+else
+    Machine=
+fi
+
+# default credentials
+defaults_file_config=$(sed '/^\s*#/d' "$defaults_file" | tac)
+
+## helper function to get value for key
+__defaults_file_config_value() {
+    _key=$1 &&
+    _value=$(grep -m 1 "^$_key=" <<< $defaults_file_config || { _grep_exit_status=$? && { [[ $_grep_exit_status -eq 1 ]] || exit "$_grep_exit_status"; }; } ) &&
+    if [[ $_value ]]; then
+        _value=$(cut -d = -f 2- <<< $_value)
+    fi &&
+
+    printf %s "$_value"
+}
+
+defaults_file_Port=$(__defaults_file_config_value port)
+if [[ $defaults_file_Port ]]; then
+    Default__Port=$defaults_file_Port
+else
+    Default__Port=22
+fi
+
+defaults_file_Username=$(__defaults_file_config_value username)
+if [[ $defaults_file_Username ]]; then
+    Default__Username=$defaults_file_Username
+else
+    Default__Username=Username
+fi
+
+defaults_file_Password=$(__defaults_file_config_value password)
+if [[ $defaults_file_Password ]]; then
+    Default__Password=$defaults_file_Password
+else
+    Default__Password=qwerty
+fi
+
+defaults_file_Keyfile=$(__defaults_file_config_value keyfile)
+if [[ $defaults_file_Keyfile ]]; then
+    Default__Keyfile=$defaults_file_Keyfile
+    if [[ $Default__Keyfile != - && $Default__Keyfile != '~' && ${Default__Keyfile::2} != '~/' && ${Default__Keyfile::1} != / ]]; then
+        >&2 echo -e '\e[1mERROR: Default keyfile path must be absolute!\e[0m'
+        exit 255
+    fi
+else
+    Default__Keyfile='~/.ssh/id_rsa'
+fi
+
+defaults_file_X2Go_Session_Type=$(__defaults_file_config_value x2go_st)
+if [[ $defaults_file_X2Go_Session_Type ]]; then
+    Default__X2Go_Session_Type=$defaults_file_X2Go_Session_Type
+else
+    Default__X2Go_Session_Type=XFCE
+fi
+
+_lock_remove
+
+# 'read' prompts
+read_prompt=$'\e[1m.>\e[0m '
+read_prompt_readline_single=$'\e[1m->\e[0m '
+read_prompt_readline_multiple=$'\e[1m=>\e[0m '
+
+# helper functions
+__escape_shell_double_quote() {
+    # escape string for use in nested Bash's double quotes
+    sed 's/[\\"$`]/\\&/g;s/./\\&/g' <<< $1
+}
+
+__escape_sed_substitute_keyword() {
+    # escape string for use as literal sed to-substitute keyword
+    sed 's/[]\/$*.^[]/\\&/g' <<< $1
+}
+
+__escape_sed_append_keyword() {
+    # escape string for use as literal sed to-append keyword
+    _output=${1//\\/\\\\} &&
+    if [[ ${_output::1} == \\ ]]; then
+        _output=\\$_output
+    fi &&
+    printf %s "$_output"
+}
+
+__unescape_shell_single() {
+    # unescape Bash-escaped word in sandbox, to contain potential code injection
+    # split words by newline character; if multiple words are split from "$1", keep only the first one
+    bwrap \
+        --unshare-all \
+        --ro-bind / / \
+        --die-with-parent \
+        --new-session \
+        bash -euo pipefail -O dotglob -O extglob -O failglob -c "printf '%s\n' $1" \
+            | head -n 1
+}
+
+__unescape_shell_multiple() {
+    # unescape Bash-escaped words in sandbox, to contain potential code injection
+    # split them by NUL
+    bwrap \
+        --unshare-all \
+        --ro-bind / / \
+        --die-with-parent \
+        --new-session \
+        bash -euo pipefail -O dotglob -O extglob -O failglob -c "printf '%s\0' $1"
+}
+
+__show_working_directory() {
+    # show working directory
+    >&2 echo -ne '\e[1mINFO: Working directory is `\e[0m' &&
+    >&2 printf %s "$PWD" &&
+    >&2 echo -e '\e[1m`.\e[0m'
+}
+
+# main functions
+_get_credentials() {
+    # get machine credentials
+
+    credentials=$(jq -r --arg v "$Machine" '.[] | select(.machine == $v) | .credentials | .[]' "$credentials_file")
+    if [[ -z $credentials ]]; then
+        >&2 echo -ne '\n\e[1mERROR: Failure getting valid config for `\e[0m'
+        >&2 printf %s "$Machine"
+        >&2 echo -e '\e[1m`!\e[0m'
+
+        ## uncache nonexistent machine
+        _uncache
+
+        exit 255
+    fi
+
+    Hostname=$(jq -r '.hostname | select(. != null)' <<< $credentials)
+    if [[ -z $Hostname || $Hostname =~ $'\n' || $Hostname =~ @ ]]; then
+        >&2 echo -ne '\n\e[1mERROR: Failure getting valid hostname for `\e[0m'
+        >&2 printf %s "$Machine"
+        >&2 echo -e '\e[1m`!\e[0m'
+        exit 255
+    fi
+
+    Port=$(jq -r '.port | select(. != null)'  <<< $credentials)
+    if [[ -z $Port || $Port =~ $'\n' ]] || ! { [[ $Port =~ ^[0-9]+$ ]] && [[ $Port == 0 || ${Port::1} != 0 ]] && [[ $Port -ge 0 && $Port -le 65535 ]]; }; then
+        >&2 echo -ne '\n\e[1mERROR: Failure getting valid port for `\e[0m'
+        >&2 printf %s "$Machine"
+        >&2 echo -e '\e[1m`!\e[0m'
+        exit 255
+    fi
+
+    Username=$(jq -r '.username | select(. != null)' <<< $credentials)
+    if [[ -z $Username || $Username =~ $'\n' || $Username =~ @ ]]; then
+        >&2 echo -ne '\n\e[1mERROR: Failure getting valid username for `\e[0m'
+        >&2 printf %s "$Machine"
+        >&2 echo -e '\e[1m`!\e[0m'
+        exit 255
+    fi
+
+    Keyfile=$(jq -r '.keyfile | select(. != null)' <<< $credentials)
+    if [[ -z $Keyfile || $Keyfile =~ $'\n' ]]; then
+        >&2 echo -ne '\n\e[1mERROR: Failure getting valid keyfile for `\e[0m'
+        >&2 printf %s "$Machine"
+        >&2 echo -e '\e[1m`!\e[0m'
+        exit 255
+    fi
+
+    Password=$(jq -r '.password | select(. != null)' <<< $credentials)
+    if [[ $Keyfile == - ]] && [[ -z $Password || $Password =~ $'\n' ]]; then
+        >&2 echo -ne '\n\e[1mERROR: Failure getting valid password for `\e[0m'
+        >&2 printf %s "$Machine"
+        >&2 echo -e '\e[1m`!\e[0m'
+        exit 255
+    fi
+
+    Sudo=$(jq -r '.sudo | select(. != null)' <<< $credentials)
+    if [[ -z $Sudo || $Sudo =~ $'\n' ]]; then
+        >&2 echo -ne '\n\e[1mERROR: Failure getting valid sudo state for `\e[0m'
+        >&2 printf %s "$Machine"
+        >&2 echo -e '\e[1m`!\e[0m'
+        exit 255
+    fi
+
+    Bash=$(jq -r '.bash | select(. != null)' <<< $credentials)
+    if [[ -z $Bash || $Bash =~ $'\n' ]]; then
+        >&2 echo -ne '\n\e[1mERROR: Failure getting valid Bash state for `\e[0m'
+        >&2 printf %s "$Machine"
+        >&2 echo -e '\e[1m`!\e[0m'
+        exit 255
+    fi
+
+    Keyfile_unexpanded=$Keyfile
+    if [[ $Keyfile == - ]]; then
+        is_keyfile_present=0
+        ssh_command=(sshpass -p "$Password" ssh -F "$ssh_config_file")
+    else
+        is_keyfile_present=1
+        if [[ $Keyfile == '~' ]]; then
+            Keyfile=~
+        elif [[ ${Keyfile::2} == '~/' ]]; then
+            Keyfile=~/${Keyfile:2}
+        fi
+        ssh_command=(ssh -i "$Keyfile" -F "$ssh_config_file")
+    fi
+
+    return 0
+}
+
+is_cache_get_name=0
+_cache() {
+    # cache machine
+
+    if [[ -s $cache_file ]]; then
+        if [[ $is_cache_get_name == 0 ]]; then
+            Custom_Name=$Machine
+        fi
+        _sed_substitute_keyword_escaped_Machine=$(__escape_sed_substitute_keyword "$Machine")
+        _sed_append_keyword_escaped_Custom_Name=$(__escape_sed_append_keyword "$Custom_Name")
+        sed -i -n "/^$_sed_substitute_keyword_escaped_Machine$/!p;\$a $_sed_append_keyword_escaped_Custom_Name" "$cache_file"
+    else
+        printf '%s\n' "$Machine" > "$cache_file"
+    fi
+
+    return 0
+}
+
+_choose() {
+    # pick machine
+
+    ## check if not empty
+    credentials_all=$(cat "$credentials_file")
+
+    if [[ $credentials_all == '[]' ]]; then
+        >&2 echo -e ' --== \e[1m(INIT)\e[0m ==--\n'
+        >&2 echo -e '\e[1mINFO: No configs found.\e[0m'
+        _edit
+    fi
+
+    ## fzf chooser
+    machine_list=$(jq -r '.[] | .machine' "$credentials_file")
+
+    ### exclude cached machines from complete machine list
+    if [[ -s $cache_file ]]; then
+        _cache=$(tac "$cache_file")
+        _cache_exclude_grep_command=(grep -Fxv)
+        _is_cache_exclude_grep_command_appended=0
+        while IFS= read -r _cache_entry; do
+            if [[ $_cache_entry ]]; then
+                _cache_exclude_grep_command+=(-e "$_cache_entry")
+                _is_cache_exclude_grep_command_appended=1
+            fi
+        done <<< $_cache
+
+        if [[ $_is_cache_exclude_grep_command_appended == 1 ]]; then
+            machine_list=$_cache$'\n\n'$("${_cache_exclude_grep_command[@]}" <<< $machine_list)
+        fi
+    fi
+
+    ### use 'print' action only if fzf version is recent enough
+    fzf_version_current=$(fzf --version)
+    fzf_version_current=${fzf_version_current%% *}
+    fzf_version_recent=0.53
+    fzf_header=$'\e[1m╷\e[0m \e[7mCR\e[0m ssh \e[7mM-Q\e[0m uncache \e[7mM-V\e[0m clrcache \e[7mM-W\e[0m edit/del \e[7mM-E\e[0m new\n\e[1m╵\e[0m \e[7mM-A\e[0m info \e[7mM-D\e[0m lookup \e[7mM-Z\e[0m ping \e[7mM-C\e[0m rsync \e[7mM-X\e[0m x2go \e[7mESC\e[0m abort'
+
+    fzf_exit_status=0
+    if [[ $fzf_version_recent == "$fzf_version_current" ]] || LC_ALL=C sort -VC <<< $fzf_version_recent$'\n'$fzf_version_current; then
+        machine_choice=$(
+            fzf +s +m <<< $machine_list \
+            --header="$fzf_header" \
+            --no-info \
+            --no-separator \
+            --wrap \
+            --tabstop=4 \
+            --ellipsis=… \
+            --bind='change:first' \
+            --bind 'enter:print(ssh)+accept' \
+            --bind 'double-click:print(ssh)+accept' \
+            --bind 'alt-q:print(uncache)+accept' \
+            --bind 'alt-v:print(clrcache)+accept' \
+            --bind 'alt-w:print(edit)+accept' \
+            --bind 'alt-e:print(new)+accept' \
+            --bind 'alt-a:print(info)+accept' \
+            --bind 'alt-d:print(lookup)+accept' \
+            --bind 'alt-z:print(ping)+accept' \
+            --bind 'alt-c:print(rsync)+accept' \
+            --bind 'alt-x:print(x2go)+accept'
+        ) || fzf_exit_status=$?
+    else
+        machine_choice=$(
+            fzf +s +m <<< $machine_list \
+            --header="$fzf_header" \
+            --bind 'enter:execute(echo ssh)+accept' \
+            --bind 'double-click:execute(echo ssh)+accept' \
+            --bind 'alt-q:execute(echo uncache)+accept' \
+            --bind 'alt-v:execute(echo clrcache)+accept' \
+            --bind 'alt-w:execute(echo edit)+accept' \
+            --bind 'alt-e:execute(echo new)+accept' \
+            --bind 'alt-a:execute(echo info)+accept' \
+            --bind 'alt-d:execute(echo lookup)+accept' \
+            --bind 'alt-z:execute(echo ping)+accept' \
+            --bind 'alt-c:execute(echo rsync)+accept' \
+            --bind 'alt-x:execute(echo x2go)+accept'
+        ) || fzf_exit_status=$?
+    fi
+
+    if [[ $fzf_exit_status -ne 0 ]]; then
+        if [[ $fzf_exit_status -eq 1 ]]; then
+            >&2 echo -e '\e[1mERROR: No machine matched!\e[0m'
+            exit "$fzf_exit_status"
+        elif [[ $fzf_exit_status -eq 130 ]]; then
+            >&2 echo -e '\e[1mINFO: Aborting.\e[0m'
+            exit 0
+        else
+            __return "$fzf_exit_status"
+        fi
+    fi
+
+    Machine=$(tail -n 1 <<< $machine_choice)
+    if [[ -z $Machine ]]; then
+        >&2 echo -e '\e[1mERROR: No machine matched!\e[0m'
+        exit 255
+    else
+        machine_choice_count=$(wc -l <<< $machine_choice)
+        if [[ $machine_choice_count -eq 1 ]]; then
+            action=$Machine
+            if [[ ! $action =~ ^(clrcache|new)$ ]]; then
+                >&2 echo -e '\e[1mERROR: No machine matched!\e[0m'
+                exit 255
+            fi
+        else
+            action=$(head -n 1 <<< $machine_choice)
+        fi
+    fi
+
+    # wait if lockfile is locked
+    _lock_create
+    _lock_remove
+
+    ## add machine to cache
+    if [[ ! $action =~ ^(uncache|clrcache|new)$ ]]; then
+        _lock_create
+        _cache
+        _lock_remove
+    fi
+
+    return 0
+}
+
+_edit() {
+    # edit or delete machine
+
+    Machine_create_verb=created
+    is_new=0
+    is_edit=0
+
+    ## helper function to delete machine
+    __edit_delete() {
+        if [[ $is_edit == 1 ]]; then
+            _Machine_to_delete=$Machine_edited
+        else
+            _Machine_to_delete=$Machine
+        fi &&
+
+        credentials_pruned=$(jq --arg v "$_Machine_to_delete" 'walk(if type == "object" and .machine == $v then empty else . end)' "$credentials_file") &&
+        printf '%s\n' "$credentials_pruned" > "$credentials_file" &&
+
+        _sed_substitute_keyword_escaped_Machine_to_delete=$(__escape_sed_substitute_keyword "$_Machine_to_delete") &&
+        sed -i "/^$_sed_substitute_keyword_escaped_Machine_to_delete$/d" "$cache_file" &&
+
+        return 0
+    }
+
+    ## helper function to check if custom name is taken
+    __edit_exists() {
+        jq -e --arg v "$1" '.[] | select(.machine == $v)' "$credentials_file" >/dev/null
+    }
+
+    _lock_create
+
+    ## ask what to do with config
+    if [[ -z $Machine ]]; then
+
+        ### this runs on 'new' action
+        is_new=1
+        >&2 echo 'Create new config? [y|N]'
+        IFS= read -rp "$read_prompt" edit_choice
+        [[ $edit_choice =~ ^[Yy] ]] || { >&2 echo -e '\n\e[1mINFO: Aborting.\e[0m' ; exit 0; }
+
+    elif ! __edit_exists "$Machine"; then
+
+        ### this runs if passed machine name does not exist
+        >&2 echo -ne '\e[1mINFO: No config found for `\e[0m'
+        >&2 printf %s "$Machine"
+        >&2 echo -e '\e[1m`.\e[0m'
+        >&2 echo 'Create? [y|N]'
+        IFS= read -rp "$read_prompt" edit_choice
+        [[ $edit_choice =~ ^[Yy] ]] || { >&2 echo -e '\n\e[1mINFO: Aborting.\e[0m' ; exit 0; }
+
+    else
+
+        ### this runs if passed machine name exists
+        >&2 echo -ne '\e[1mINFO: Config found for `\e[0m'
+        >&2 printf %s "$Machine"
+        >&2 echo -e '\e[1m`.\e[0m'
+        >&2 echo 'Edit (e) / Delete (d)? [e|d|N]'
+        IFS= read -rp "$read_prompt" edit_choice
+
+        if [[ $edit_choice =~ ^[Ee] ]]; then
+            is_edit=1
+            Machine_edited=$Machine
+            Machine_create_verb=edited
+        elif [[ $edit_choice =~ ^[Dd] ]]; then
+            __edit_delete
+            >&2 echo -ne '\n\e[1mINFO: Config deleted for `\e[0m'
+            >&2 printf %s "$Machine"
+            >&2 echo -e '\e[1m`.\e[0m'
+            exit 0
+        else
+            >&2 echo -e '\n\e[1mINFO: Aborting.\e[0m'
+            exit 0
+        fi
+    fi
+
+    >&2 echo
+
+    ## get values for new machine
+    if [[ $is_new == 1 ]]; then
+
+        ### this runs on 'new' action
+        while :; do
+            >&2 echo 'Custom Name?'
+            IFS= read -rp "$read_prompt" Custom_Name
+            if [[ -z $Custom_Name ]]; then
+                >&2 echo -e '\n\e[1mWARNING: No custom name provided!\e[0m\n'
+                continue
+            fi
+            break
+        done
+        if __edit_exists "$Custom_Name"; then
+            >&2 echo -ne '\n\e[1mWARNING: Config found for `\e[0m'
+            >&2 printf %s "$Custom_Name"
+            >&2 echo -e '\e[1m`!\e[0m'
+            >&2 echo 'Edit? [y|N]'
+            IFS= read -rp "$read_prompt" edit_choice
+            [[ $edit_choice =~ ^[Yy] ]] || { >&2 echo -e '\n\e[1mINFO: Aborting.\e[0m' ; exit 0; }
+            Machine_create_verb=edited
+            Machine=$Custom_Name
+            _get_credentials
+            >&2 echo
+        fi
+        Machine=$Custom_Name
+        Hostname=$Custom_Name
+
+    elif [[ $is_edit == 1 ]]; then
+
+        ### this runs when editing existing machine
+        _get_credentials
+
+        while :; do
+            >&2 echo "Custom Name? [$Machine]"
+            IFS= read -rp "$read_prompt" Custom_Name
+            if [[ $Custom_Name ]]; then
+                if [[ $Custom_Name != "$Machine" ]] && __edit_exists "$Custom_Name"; then
+                    >&2 echo -ne '\n\e[1mWARNING: Another config found for `\e[0m'
+                    >&2 printf %s "$Custom_Name"
+                    >&2 echo -e '\e[1m`!\e[0m\n'
+                    continue
+                fi
+                Machine=$Custom_Name
+            else
+                Custom_Name=$Machine
+            fi
+            break
+        done
+
+    else
+
+        ### this runs when creating new machine from passed name that does not exist
+        Custom_Name=$Machine
+
+    fi
+
+    Hostname_original=${Hostname:-$Machine}
+    while :; do
+        >&2 echo "Hostname? [$Hostname_original]"
+        IFS= read -rp "$read_prompt" Hostname_answer
+        if [[ $Hostname_answer ]]; then
+            Hostname=$Hostname_answer
+        else
+            Hostname=$Hostname_original
+        fi
+        if [[ $Hostname =~ @ ]]; then
+            >&2 echo -ne '\n\e[1mWARNING: Hostname cannot contain `\e[0m'
+            >&2 printf %s '@'
+            >&2 echo -e '\e[1m` characters!\e[0m\n'
+            continue
+        fi
+        break
+    done
+
+    Port_original=${Port:-$Default__Port}
+    while :; do
+        >&2 echo "Port? [$Port_original]"
+        IFS= read -rp "$read_prompt" Port_answer
+        if [[ $Port_answer ]]; then
+            Port=$Port_answer
+        else
+            Port=$Port_original
+        fi
+
+        if ! { [[ $Port =~ ^[0-9]+$ ]] && [[ $Port == 0 || ${Port::1} != 0 ]] && [[ $Port -ge 0 && $Port -le 65535 ]]; }; then
+            >&2 echo -ne '\n\e[1mWARNING: Port must be a number in the `\e[0m'
+            >&2 printf %s '0-65535'
+            >&2 echo -e '\e[1m` range!\e[0m\n'
+            continue
+        fi
+        break
+    done
+
+    Username_original=${Username:-$Default__Username}
+    while :; do
+        >&2 echo "Username? [$Username_original]"
+        IFS= read -rp "$read_prompt" Username_answer
+        if [[ $Username_answer ]]; then
+            Username=$Username_answer
+        else
+            Username=$Username_original
+        fi
+        if [[ $Username =~ @ ]]; then
+            >&2 echo -ne '\n\e[1mWARNING: Username cannot contain `\e[0m'
+            >&2 printf %s '@'
+            >&2 echo -e '\e[1m` characters!\e[0m\n'
+            continue
+        fi
+        break
+    done
+
+    [[ $is_edit == 1 ]] && Keyfile=$Keyfile_unexpanded
+    Keyfile_original=${Keyfile:-$Default__Keyfile}
+    __show_working_directory
+    >&2 echo "Keyfile? [$Keyfile_original] (\`-\` for password auth)"
+    IFS= read -rep "$read_prompt_readline_single" Keyfile_answer
+    if [[ $Keyfile_answer ]]; then
+        Keyfile=$Keyfile_answer
+        if [[ $Keyfile != - ]]; then
+            Keyfile=$(__unescape_shell_single "$Keyfile")
+            Keyfile=$(realpath --relative-base="$HOME" -- "$Keyfile")
+            if [[ $Keyfile == - ]]; then
+                Keyfile='~'
+            elif [[ ${Keyfile::1} != / ]]; then
+                Keyfile="~/$Keyfile"
+            fi
+        fi
+    else
+        Keyfile=$Keyfile_original
+    fi
+    if [[ $Keyfile != - ]]; then
+        >&2 echo "INFO: Resolved keyfile path: \`$Keyfile\`"
+    fi
+
+    if [[ $Keyfile != - ]]; then
+        >&2 echo 'Keyfile provided. Also provide password? [Y/n]'
+        IFS= read -rp "$read_prompt" password_also_answer
+        if [[ -z $password_also_answer || $password_also_answer =~ ^[Yy] ]]; then
+            is_keyfile_and_password=1
+        else
+            is_keyfile_and_password=0
+        fi
+    else
+        is_keyfile_and_password=1
+    fi
+
+    if [[ $is_keyfile_and_password == 1 ]]; then
+        Password=${Password:-$Default__Password}
+        >&2 echo "Password? [$Password]"
+        IFS= read -rp "$read_prompt" Password_answer
+        [[ $Password_answer ]] && Password=$Password_answer
+    else
+        Password=
+    fi
+
+    if [[ $Username == root ]]; then
+        >&2 echo 'Passwordless sudo? [N] (Linux with Bash only)'
+        >&2 echo '> N (user is `root`)'
+        Sudo_answer=N
+    elif [[ $is_keyfile_and_password == 0 ]]; then
+        >&2 echo 'Passwordless sudo? [N] (Linux with Bash only)'
+        >&2 echo '> N (no password)'
+        Sudo_answer=N
+    elif [[ -z ${Sudo+x} || $Sudo == true ]]; then
+        >&2 echo 'Passwordless sudo? [Y/n] (Linux with Bash only)'
+        IFS= read -rp "$read_prompt" Sudo_answer
+        [[ -z $Sudo_answer ]] && Sudo_answer=Y
+    else
+        >&2 echo 'Passwordless sudo? [y/N] (Linux with Bash only)'
+        IFS= read -rp "$read_prompt" Sudo_answer
+        [[ -z $Sudo_answer ]] && Sudo_answer=N
+    fi
+    if [[ $Sudo_answer =~ ^[Yy] ]]; then
+        Sudo=true
+    else
+        Sudo=false
+    fi
+
+    if [[ $Sudo == true ]]; then
+        >&2 echo 'Bash shell? [Y]'
+        >&2 echo '> Y (passwordless sudo is `true`)'
+        Bash_answer=Y
+    else
+        >&2 echo 'Bash shell? [Y/n]'
+        IFS= read -rp "$read_prompt" Bash_answer
+        [[ -z $Bash_answer ]] && Bash_answer=Y
+    fi
+    if [[ $Bash_answer =~ ^[Yy] ]]; then
+        Bash=true
+    else
+        Bash=false
+    fi
+
+    ## configure new machine
+    if [[ $is_new == 1 || $is_edit == 1 ]]; then
+        __edit_delete
+    fi
+    credentials_pruned=$(jq --arg v "$Custom_Name" 'walk(if type == "object" and .machine == $v then empty else . end)' "$credentials_file")
+
+    if [[ $Custom_Name != "$Machine" ]]; then
+        credentials_pruned=$(jq --arg v "$Machine" 'walk(if type == "object" and .machine == $v then empty else . end)' <<< $credentials_pruned)
+    fi
+
+    ### remove old machine name from cache and add new one
+    is_cache_get_name=1
+
+    jq \
+        --arg     machine   "$Custom_Name" \
+        --arg     hostname  "$Hostname" \
+        --arg     port      "$Port" \
+        --arg     username  "$Username" \
+        --arg     password  "$Password" \
+        --arg     keyfile   "$Keyfile" \
+        --argjson sudo      "$Sudo" \
+        --argjson bash      "$Bash" \
+        '. + [ { "machine": $machine, "credentials": [ { "hostname": $hostname, "port": $port, "username": $username, "password": $password, "keyfile": $keyfile, "sudo": $sudo, "bash": $bash, } ] } ] | sort_by(.machine)' \
+            <<< $credentials_pruned > "$credentials_file"
+
+    ## add machine to cache
+    _uncache
+    _cache
+
+    _lock_remove
+
+    >&2 echo -ne "\n\e[1mINFO: Config $Machine_create_verb for \`\e[0m"
+    >&2 printf %s "$Custom_Name"
+    >&2 echo -e '\e[1m`.\e[0m'
+
+    exit 0
+}
+
+_ssh() {
+    # connect to machine with SSH, potentially with extra tweaks
+
+    # XXX Bash tweaks
+    bash_tweaks=". -- ~/.bashrc ; export LANG=en_US.UTF-8 XDG_RUNTIME_DIR=/run/user/\$EUID ; HISTCONTROL=ignoreboth ; set +H ; shopt -s autocd cdspell dotglob extglob ; stty -echoctl ; function /() { cd /; } ; function ..() { cd ..; } ; function ...() { cd ../..; } ; function ....() { cd ../../..; } ; function .....() { cd ../../../..; } ; function -() { cd -; } ; bind 'set completion-ignore-case on' ; bind 'set mark-symlinked-directories on' ; bind 'set show-all-if-ambiguous on' ; bind 'set colored-stats on' ; alias l=ls ; alias la='ls -A' ; alias ll='ls -lh' ; alias lo='ls -Alh' ; alias trea='tree -a' ; export LESS=-i SYSTEMD_PAGER='less -i' ; alias sudo=\"env LESS=-i SYSTEMD_PAGER='less -i' sudo \" ; PS1='\$(if [[ \$? -eq 0 ]]; then printf +; else printf -; fi) '\$(bash -ic 'printf %s \"'\\\$'PS1\"') ; PROMPT_DIRTRIM=3 ; if [[ -f /usr/share/bash-completion/bash_completion ]]; then . /usr/share/bash-completion/bash_completion; elif [[ -f /etc/bash_completion ]]; then . /etc/bash_completion; fi"
+
+    if [[ $Bash == true ]]; then
+        bash_tweaks_semi_escaped=$(sed 's/[\\"$`]/\\&/g' <<< $bash_tweaks)
+        bash_sudo_tweak="\\\"\\\$(basename -- \\\"\\\${1-root}\\\")\\\" bash -c \\\"bash --rcfile <(printf %s \\\\\\\"$(sed 's/[\\"$`]/\\\\\\\\\\\\\\&/g' <<< $bash_tweaks)\\\\\\\")\\\""
+    fi
+
+    ssh_exit_status=0
+
+    if [[ $Sudo == true ]]; then
+
+        if [[ $Bash == true ]]; then
+
+        _shell_double_quote_escaped_Password=$(__escape_shell_double_quote "$Password")
+        "${ssh_command[@]}" -p "$Port" -t -- "$Username@$Hostname" \
+            "bash --rcfile <(printf %s \"$bash_tweaks_semi_escaped ; function .su() { command sudo -Hu $bash_sudo_tweak; } ; function .si() { command sudo -Hiu $bash_sudo_tweak; } ; printf '%s\n' $_shell_double_quote_escaped_Password | command sudo -Sv 2>/dev/null && trap '' INT && while :; do read -t 30 <> <(:) || : ; command sudo -v 2>/dev/null; done &\")" \
+                || ssh_exit_status=$?
+
+        else
+
+            >&2 echo -ne '\n\e[1mERROR: Sudo is `\e[0m'
+            >&2 printf %s 'true'
+            >&2 echo -ne '\e[1m` but Bash is `\e[0m'
+            >&2 printf %s 'false'
+            >&2 echo -e '\e[1m`!\e[0m'
+            exit 255
+
+        fi
+
+    elif [[ $Bash == true ]]; then
+
+        "${ssh_command[@]}" -p "$Port" -t -- "$Username@$Hostname" \
+            "bash --rcfile <(printf %s \"$bash_tweaks_semi_escaped ; function .su() { command sudo -Hu $bash_sudo_tweak; } ; function .si() { command sudo -Hiu $bash_sudo_tweak; }\")" \
+                || ssh_exit_status=$?
+
+    else
+
+        "${ssh_command[@]}" -p "$Port" -- "$Username@$Hostname" \
+            || ssh_exit_status=$?
+
+    fi
+
+    if [[ $ssh_exit_status -eq 255 ]]; then
+        >&2 echo -e '\n\e[1mWARNING: SSH exit status 255: Something likely went wrong!\e[0m'
+        exit 0
+    fi
+
+    >&2 echo
+
+    return 0
+}
+
+_info() {
+    # output machine info
+
+    if [[ $Keyfile == - ]]; then
+        Password_echo=(echo $'\e[1mPASS:\e[0m  '"$Password")
+        Keyfile_echo=(echo -e '\e[1mKEYF:\e[0m  \e[3m- (password auth)\e[0m')
+    else
+        Password_echo=(echo -e '\e[1mPASS:\e[0m  \e[3m(none)\e[0m')
+        Keyfile_echo=(echo $'\e[1mKEYF:\e[0m  '"$Keyfile_unexpanded")
+    fi
+
+    echo
+    echo -ne '\e[1mHOST:\e[0m  '
+    printf '%s\n' "$Hostname"
+    echo -ne '\e[1mPORT:\e[0m  '
+    printf '%s\n' "$Port"
+    echo -ne '\e[1mUSER:\e[0m  '
+    printf '%s\n' "$Username"
+    "${Password_echo[@]}"
+    "${Keyfile_echo[@]}"
+    echo
+    echo -ne '\e[1mSUDO:\e[0m  '
+    printf '%s\n' "$Sudo"
+    echo -ne '\e[1mBASH:\e[0m  '
+    printf '%s\n' "$Bash"
+    echo
+
+    return 0
+}
+
+_lookup() {
+    # output machine's IP address and hostname
+
+    host_exit_status=0
+    lookup=$(host -- "$Hostname" 2>/dev/null | grep -Em 1 ' (has address|domain name pointer) ') \
+        || host_exit_status=$?
+
+    if [[ $host_exit_status -eq 0 ]]; then
+
+        lookup_answer=$(grep -Eo '[^ ]+$' <<< $lookup)
+        if [[ ${lookup_answer: -1} == . ]]; then
+            lookup_ip=$Hostname
+            lookup_dns=${lookup_answer%?}
+        else
+            lookup_ip=$lookup_answer
+            lookup_dns=$(grep -Eo '^[^ ]+' <<< $lookup)
+        fi
+
+        echo
+        echo -ne '\e[1mIP: \e[0m  '
+        printf '%s\n' "$lookup_ip"
+        echo -ne '\e[1mDNS:\e[0m  '
+        printf '%s\n' "$lookup_dns"
+        echo
+
+    else
+
+        >&2 echo -e '\n\e[3m(failed)\e[0m\n'
+        exit 255
+
+    fi
+
+    return 0
+}
+
+_ping() {
+    # ping machine
+
+    ping -- "$Hostname"
+
+    return 0
+}
+
+_rsync() {
+    # copy files to or from machine with rsync
+
+    if [[ $Bash == true ]]; then
+
+        while :; do
+            >&2 echo 'Copy to or from? [t/f]'
+            IFS= read -rp "$read_prompt" rsync_how
+
+            if [[ $rsync_how =~ ^[Tt] ]]; then
+                is_rsync_to=1
+                rsync_part_one=
+                rsync_part_two=$Username@$Hostname:
+            elif [[ $rsync_how =~ ^[Ff] ]]; then
+                is_rsync_to=0
+                rsync_part_one=$Username@$Hostname:
+                rsync_part_two=
+            else
+                >&2 echo -e '\n\e[1mWARNING: Illegal answer!\e[0m\n'
+                continue
+            fi
+            break
+        done
+
+        ## ask for source path
+        while :; do
+            __show_working_directory
+            if [[ $is_rsync_to == 1 ]]; then
+                rsync_what=()
+                >&2 echo 'Copy what? (local path) [.]'
+                IFS= read -rep "$read_prompt_readline_multiple" _rsync_what_raw
+                if [[ $_rsync_what_raw ]]; then
+                    while IFS= read -rd '' _rsync_what_tmp; do
+                        rsync_what+=("$_rsync_what_tmp")
+                    done < <(__unescape_shell_multiple "$_rsync_what_raw")
+                    wait $!
+                    if [[ ${#rsync_what[@]} -eq 0 ]]; then
+                        >&2 echo -e '\n\e[1mWARNING: No source path provided!\e[0m\n'
+                        continue
+                    fi
+                else
+                    rsync_what=(.)
+                fi
+            else
+                rsync_what=
+                >&2 echo 'Copy what? (remote path) [~/]'
+                IFS= read -rep "$read_prompt_readline_single" rsync_what
+                if [[ $rsync_what ]]; then
+                    if [[ $rsync_what == '~' || ${rsync_what::2} == '~/' ]]; then
+                        rsync_what=\\$rsync_what
+                    fi
+                    rsync_what=$(__unescape_shell_single "$rsync_what")
+                    if [[ -z $rsync_what ]]; then
+                        >&2 echo -e '\n\e[1mWARNING: No source path provided!\e[0m\n'
+                        continue
+                    fi
+                    rsync_what=("$rsync_what")
+                else
+                    rsync_what=('~/')
+                fi
+            fi
+            break
+        done
+
+        ## ask for destination path
+        while :; do
+            rsync_where=
+            __show_working_directory
+            if [[ $is_rsync_to == 0 ]]; then
+                >&2 echo 'Copy where? (local path) [.]'
+                IFS= read -rep "$read_prompt_readline_single" rsync_where
+                rsync_where=$(__unescape_shell_single "$rsync_where")
+                if [[ -z $rsync_where ]]; then
+                    rsync_where=.
+                    break
+                fi
+            else
+                >&2 echo 'Copy where? (remote path) [~]'
+                IFS= read -rep "$read_prompt_readline_single" rsync_where
+                if [[ $rsync_where == '~' || ${rsync_where::2} == '~/' ]]; then
+                    rsync_where=\\$rsync_where
+                fi
+                rsync_where=$(__unescape_shell_single "$rsync_where")
+                if [[ -z $rsync_where ]]; then
+                    rsync_where='~'
+                    break
+                fi
+            fi
+            if [[ -z $rsync_where ]]; then
+                >&2 echo -e '\n\e[1mWARNING: No destination path provided!\e[0m\n'
+                continue
+            fi
+            break
+        done
+
+        if [[ $is_rsync_to == 1 ]]; then
+            _rsync_where_tmp=$rsync_part_two$rsync_where
+            _rsync_preview_tmp=("${rsync_what[@]@Q}" "${_rsync_where_tmp@Q}")
+        else
+            _rsync_what_tmp=$rsync_part_one${rsync_what[0]}
+            _rsync_preview_tmp=("${_rsync_what_tmp@Q}" "${rsync_where@Q}")
+        fi
+        _rsync_preview=$' rsync \e[3m[opts]\e[0m '${_rsync_preview_tmp[*]}
+
+        __show_working_directory
+        >&2 echo -e '\n\e[1mINFO: Command preview:\e[0m'
+        printf '%s\n' "$_rsync_preview"
+        >&2 echo -e '\nProceed? [y/N]'
+        IFS= read -rp "$read_prompt" rsync_proceed
+
+        if [[ $is_keyfile_present == 0 ]]; then
+            _shell_escaped_Port=${Port@Q}
+            rsync_cmd=(sshpass -p "$Password" rsync -aPh -e "ssh -p $_shell_escaped_Port" -- "$rsync_part_one${rsync_what[@]}" "$rsync_part_two$rsync_where")
+        else
+            _shell_escaped_Port=${Port@Q}
+            _shell_escaped_Keyfile=${Keyfile@Q}
+            rsync_cmd=(rsync -aPh -e "ssh -p $_shell_escaped_Port -i $_shell_escaped_Keyfile" -- "$rsync_part_one${rsync_what[@]}" "$rsync_part_two$rsync_where")
+        fi
+
+        # run rsync
+        if [[ $rsync_proceed =~ ^[Yy] ]]; then
+
+            until
+                >&2 echo
+                "${rsync_cmd[@]}"
+            do
+                >&2 echo -e '\n\e[1mWARNING: Failure transfering files! Retrying rsync indefinitely…\e[0m'
+                sleep 2
+            done
+
+        else
+
+            >&2 echo -e '\n\e[1mINFO: Aborting.\e[0m'
+            exit 0
+
+        fi
+
+    else
+
+        >&2 echo -ne '\e[1mERROR: Bash is `\e[0m'
+        >&2 printf %s 'false'
+        >&2 echo -e '\e[1m`!\e[0m'
+        exit 255
+
+    fi
+
+    return 0
+}
+
+_x2go() {
+    # connect to machine with X2Go
+
+    x2go_sudo_Username=$Username
+
+    if [[ $Sudo == true ]]; then
+
+        if [[ $Bash == true ]]; then
+
+            ## generate temporary X2Go SSH key if nonexistent
+            x2go_private_key_file=$script_generic_dir/$script_generic_name.x2go.key
+            x2go_public_key_file=$x2go_private_key_file.pub
+
+            if [[ ! -f $x2go_private_key_file || ! -f $x2go_public_key_file ]]; then
+                >&2 echo -e '\n\e[1mINFO: Generating X2Go SSH key pair…\e[0m\n'
+                _lock_create
+                rm -f "$x2go_private_key_file" "$x2go_public_key_file"
+                ssh-keygen -t rsa -b 4096 -f "$x2go_private_key_file" -C x2go-temp -N ''
+                chmod 400 "$x2go_private_key_file" "$x2go_public_key_file"
+                _lock_remove
+            fi
+
+            ## get usernames for autocompletion
+            >&2 echo -e '\n\e[1mINFO: Getting user list…\e[0m'
+
+            x2go_remote_users=()
+            if \
+                x2go_remote_passwd_file=$(
+                    2>/dev/null "${ssh_command[@]}" -p "$Port" -t -- "$Username@$Hostname" \
+                        'cat /etc/passwd'
+                )
+            then
+                while IFS= read -r _x2go_remote_passwd_file_entry; do
+                    _x2go_remote_passwd_file_entry_uid=$(cut -d : -f 3 <<< $_x2go_remote_passwd_file_entry) \
+                        && if [[ $_x2go_remote_passwd_file_entry_uid =~ ^[0-9]+$ && $_x2go_remote_passwd_file_entry_uid -ge 1000 && $_x2go_remote_passwd_file_entry_uid -lt 65534 ]]; then
+                            _x2go_remote_passwd_file_entry_username=${_x2go_remote_passwd_file_entry%%:*}
+                            if [[ ! $_x2go_remote_passwd_file_entry_username =~ / ]]; then
+                                x2go_remote_users+=("$_x2go_remote_passwd_file_entry_username")
+                            fi
+                        fi
+                done <<< $x2go_remote_passwd_file
+            else
+                >&2 echo -e '\n\e[1mWARNING: Failure getting user list from machine!\e[0m'
+            fi
+
+            x2go_tmp_dir=${TMPDIR:-/tmp}
+            x2go_tmp_dir=$(mktemp -p "$x2go_tmp_dir" -d "_$script_generic_name.x2go.XXXXXXXXXX")
+            x2go_tmp_dir=$(realpath -s -- "$x2go_tmp_dir")
+
+            trap 'rm -rf "$x2go_tmp_dir" ; if [[ $BASH_SUBSHELL -eq 0 ]]; then >&2 echo -e "\n\e[1mERROR: Unexpected issue!\e[0m" ; exit 255; fi' ERR
+            trap 'rm -rf "$x2go_tmp_dir" ; >&2 echo -e "\n\e[1mERROR: Signal interrupt!\e[0m" ; exit 255' HUP TERM
+            trap 'rm -rf "$x2go_tmp_dir" ; >&2 echo -e "\n\e[1mINFO: User interrupt.\e[0m" ; exit 0' INT
+            cd "$x2go_tmp_dir"
+
+            ## ask for username with autocompletion
+            if [[ ${#x2go_remote_users[@]} -gt 0 ]]; then
+                touch -- "${x2go_remote_users[@]}"
+                >&2 echo ; ls --color=never -A ; >&2 echo
+            else
+                >&2 echo -e '\n\e[3m(none found)\e[0m\n'
+            fi
+            >&2 echo "Username? [$x2go_sudo_Username]"
+            IFS= read -rep "$read_prompt_readline_single" Username
+
+            if [[ $Username ]]; then
+                if [[ ${Username::1} == '~' ]]; then
+                    Username=\\$Username
+                fi
+                Username=$(__unescape_shell_single "$Username")
+                if [[ $Username == root ]]; then
+                    >&2 echo -e '\n\e[1mERROR: Refusing to connect with X2Go as root!\e[0m'
+                    exit 255
+                fi
+            else
+                Username=$x2go_sudo_Username
+            fi
+            cd "$OLDPWD"
+
+            ## ask for session type
+            >&2 echo "Session type? [$Default__X2Go_Session_Type]"
+            IFS= read -rp "$read_prompt" X2Go_Session_Type_answer
+            if [[ $X2Go_Session_Type_answer ]]; then
+                X2Go_Session_Type=$X2Go_Session_Type_answer
+            else
+                X2Go_Session_Type=$Default__X2Go_Session_Type
+            fi
+
+            >&2 echo
+            x2go_public_key=$(cat "$x2go_public_key_file")
+            _shell_escaped_Password=${Password@Q}
+
+            ## helper function to remove temporary X2Go SSH key from machine
+            __key_machine_remove() {
+
+                >&2 echo -e '\n\e[1mINFO: Removing temporary SSH key from the machine…\e[0m\n'
+
+                _shell_escaped_Username=${Username@Q} &&
+                _sed_substitute_keyword_escaped_x2go_public_key=$(__escape_sed_substitute_keyword "$x2go_public_key") &&
+                _shell_double_quote_escaped_sed_substitute_keyword_x2go_public_key=$(__escape_shell_double_quote "$_sed_substitute_keyword_escaped_x2go_public_key") &&
+
+                "${ssh_command[@]}" -p "$Port" -t -- "$x2go_sudo_Username@$Hostname" \
+                    "id -- $_shell_escaped_Username >/dev/null && printf '%s\n' $_shell_escaped_Password | sudo -Sv 2>/dev/null && sudo -Hu $_shell_escaped_Username bash -c \"[[ -d ~ ]] && sed -i -- /^$_shell_double_quote_escaped_sed_substitute_keyword_x2go_public_key$/d ~/.ssh/authorized_keys\"" &&
+
+                >&2 echo -e '\n\e[1mINFO: Removed temporary SSH key from the machine.\e[0m'
+
+            }
+
+            ## on error, remove temporary X2Go SSH key from machine, and machine's temporary X2Go directory
+            trap 'if [[ $BASH_SUBSHELL -eq 0 ]]; then >&2 echo -e "\n\e[1mERROR: X2Go: Will attempt to remove temporary SSH key from the machine…\e[0m" ; __key_machine_remove || >&2 echo -e "\n\e[1mERROR: Failure removing temporary SSH key from the machine!\e[0m" ; rm -rf "$x2go_tmp_dir" ; >&2 echo -e "\n\e[1mERROR: X2Go: Unexpected issue!\e[0m" ; exit 255; fi' ERR
+
+            ## place X2Go SSH key on machine temporarily
+            >&2 echo -e '\e[1mINFO: Placing temporary SSH key on the machine…\e[0m\n'
+
+            _shell_escaped_Username=${Username@Q}
+            _shell_double_quote_escaped_x2go_public_key=$(__escape_shell_double_quote "$x2go_public_key")
+
+            _lock_create
+
+            "${ssh_command[@]}" -p "$Port" -t -- "$x2go_sudo_Username@$Hostname" \
+            "id -- $_shell_escaped_Username >/dev/null && printf '%s\n' $_shell_escaped_Password | sudo -Sv 2>/dev/null && sudo -Hu $_shell_escaped_Username bash -c \"[[ -d ~ ]] && chmod -- go-w ~/ && if [[ -d ~/.ssh ]]; then chmod -- 700 ~/.ssh/; else mkdir -m 700 -- ~/.ssh; fi && if [[ -f ~/.ssh/authorized_keys ]]; then chmod -- 600 ~/.ssh/authorized_keys && if [[ -s ~/.ssh/authorized_keys ]]; then v=\\\$(tail -c 1 -- ~/.ssh/authorized_keys) && if [[ \\\$v ]]; then echo >> ~/.ssh/authorized_keys; fi; else install -Tm 600 -- /dev/null ~/.ssh/authorized_keys; fi; fi && printf '%s\n' $_shell_double_quote_escaped_x2go_public_key >> ~/.ssh/authorized_keys\"" \
+                || { >&2 echo -e '\n\e[1mERROR: Failure placing temporary SSH key on the machine!\e[0m' ; rm -rf "$x2go_tmp_dir" ; exit 255; }
+
+            _lock_remove
+
+            >&2 echo -e '\n\e[1mINFO: Placed temporary SSH key on the machine.\e[0m\n'
+
+            ## prepare X2Go config file
+            x2go_config=(
+                "[$Hostname]"
+                'autologin=true'
+                'clipboard=both'
+                "command=$X2Go_Session_Type"
+                'fullscreen=false'
+                'height=1080'
+                "host=$Hostname"
+                "key=$x2go_private_key_file"
+                "name=$Machine"
+                'print=false'
+                'sound=false'
+                "sshport=$Port"
+                "user=$Username"
+                'width=1920'
+            )
+
+            x2go_config_file=$(mktemp -p "$x2go_tmp_dir" x2go-config.XXXXXXXXXX)
+            printf '%s\n' "${x2go_config[@]}" > "$x2go_config_file"
+
+            ## run X2Go
+            x2goclient --no-autoresume --hide --user="$Username" --sessionid="$Hostname" --session-conf="$x2go_config_file"
+
+            ## remove temporary X2Go SSH key from machine
+            __key_machine_remove
+
+            ## remove temporary X2Go directory
+            rm -rf "$x2go_tmp_dir"
+
+        else
+
+            >&2 echo -ne '\n\e[1mERROR: Bash is `\e[0m'
+            >&2 printf %s 'false'
+            >&2 echo -e '\e[1m`!\e[0m'
+            exit 255
+
+        fi
+
+    else
+
+        >&2 echo -ne '\n\e[1mERROR: Sudo is `\e[0m'
+        >&2 printf %s 'false'
+        >&2 echo -e '\e[1m`!\e[0m'
+        exit 255
+
+    fi
+
+    return 0
+}
+
+_uncache() {
+    # remove machine from cache
+
+    _sed_substitute_keyword_escaped_Machine=$(__escape_sed_substitute_keyword "$Machine")
+    sed -i "/^$_sed_substitute_keyword_escaped_Machine$/d" "$cache_file"
+
+    return 0
+}
+
+_clrcache() {
+    # clear cache
+
+    > "$cache_file"
+
+    return 0
+}
+
+####################################################################################################
+
+# get machine name and/or perform select actions based on fzf choice
+if [[ -z $Machine ]]; then
+    _choose
+else
+    >&2 echo -e ' --== \e[1m(PASSED)\e[0m ==--\n'
+    _edit
+fi
+
+case $action in
+    new)
+        Machine=
+        header_space=
+        ;;
+    uncache)
+        _lock_create
+        _uncache
+        _lock_remove
+        exec "$this_script"
+        ;;
+    clrcache)
+        _lock_create
+        _clrcache
+        _lock_remove
+        exec "$this_script"
+        ;;
+    *)
+        header_space=' '
+        ;;
+esac
+
+>&2 echo $' --== \e[1m['"${action^^}"$']\e[0m'"$header_space$Machine ==--"
+
+# perform select actions based on fzf choice
+case $action in
+    ssh)
+        _lock_create
+        _get_credentials
+        _lock_remove
+        _ssh
+        ;;
+    edit)
+        >&2 echo
+        _edit
+        ;;
+    new)
+        _edit
+        ;;
+    info)
+        _lock_create
+        _get_credentials
+        _lock_remove
+        _info
+        ;;
+    lookup)
+        __command_check host
+        _lock_create
+        _get_credentials
+        _lock_remove
+        _lookup
+        ;;
+    ping)
+        __command_check ping
+        _lock_create
+        _get_credentials
+        _lock_remove
+        trap - INT
+        _ping
+        ;;
+    rsync)
+        __command_check rsync
+        _lock_create
+        _get_credentials
+        _lock_remove
+        >&2 echo
+        _rsync
+        ;;
+    x2go)
+        __command_check x2goclient
+        _lock_create
+        _get_credentials
+        _lock_remove
+        _x2go
+        ;;
+    *)
+        false
+        ;;
+esac
+
+# exit
+exit 0
