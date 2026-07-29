@@ -1,0 +1,8 @@
+ssh-manager.defaults
+ssh-manager.credentials
+ssh-manager.cache
+ssh-manager_x2go.key
+ssh-manager_x2go.key.pub
+
+*~
+*.swp
